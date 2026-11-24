@@ -1,0 +1,13 @@
+[package]
+name = "ncm-converter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.8"
+hound = "3.5.1"
+mp3lame-encoder = "0.3.0"
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+symphonia = { version = "0.5", features = ["mp3", "flac"] }
