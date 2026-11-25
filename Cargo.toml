@@ -1,5 +1,5 @@
 [package]
-name = "ncm-converter"
+name = "zeringo"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,4 +10,5 @@ mp3lame-encoder = "0.3.0"
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
+objc2-service-management = "0.3.2"
 symphonia = { version = "0.5", features = ["mp3", "flac"] }

@@ -1,9 +1,9 @@
-//! NCM 转换器（macOS）。
+//! ZeRingo：NCM 格式转换器（macOS）。
 //!
 //! 常驻菜单栏。按住 ⌥ Option 键拖动 .ncm 文件时，光标处会出现一个圆环：
 //! 拖进左半边转 MP3，拖进右半边转 WAV，输出到源文件同目录。
 //!
-//! 也可以命令行使用：`ncm-converter mp3|wav 文件...`
+//! 也可以命令行使用：`zeringo mp3|wav 文件...`
 
 mod convert;
 mod ncm;
@@ -22,13 +22,14 @@ use objc2_app_kit::{
     NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventModifierFlags, NSFont,
     NSFontAttributeName, NSFontDescriptorSystemDesignRounded, NSFontWeightBold,
     NSFontWeightSemibold, NSForegroundColorAttributeName, NSGradient, NSGraphicsContext, NSShadow,
-    NSAnimatablePropertyContainer, NSMenu, NSMenuItem, NSPasteboard,
+    NSAnimatablePropertyContainer, NSControlStateValueOff, NSControlStateValueOn, NSMenu, NSMenuItem, NSPasteboard,
     NSPasteboardNameDrag, NSPasteboardTypeFileURL, NSStatusBar, NSStatusItem,
     NSStringDrawing, NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
+use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use objc2_foundation::{
-    NSArray, NSDictionary, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
+    NSArray, NSBundle, NSDictionary, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
 };
 
 /// 触发圆环的按键。可改成 Control / Command / Shift。
@@ -97,7 +98,7 @@ struct RingIvars {
 define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
-    #[name = "NcmRingView"]
+    #[name = "ZeRingoRingView"]
     #[ivars = RingIvars]
     struct RingView;
 
@@ -315,12 +316,14 @@ struct ControllerIvars {
     /// 已检查过是否含 .ncm 的 changeCount，避免每帧重复读剪贴板
     checked: Cell<isize>,
     title: RefCell<String>,
+    last_item: Retained<NSMenuItem>,
+    login_item: Retained<NSMenuItem>,
 }
 
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "NcmController"]
+    #[name = "ZeRingoController"]
     #[ivars = ControllerIvars]
     struct Controller;
 
@@ -329,6 +332,19 @@ define_class!(
         fn tick(&self, _timer: &NSTimer) {
             self.poll();
             self.refresh_status();
+        }
+
+        #[unsafe(method(toggleLogin:))]
+        fn toggle_login(&self, _sender: &NSMenuItem) {
+            let svc = unsafe { SMAppService::mainAppService() };
+            let enabled = unsafe { svc.status() } == SMAppServiceStatus::Enabled;
+            let r = unsafe {
+                if enabled { svc.unregisterAndReturnError() } else { svc.registerAndReturnError() }
+            };
+            if let Err(e) = r {
+                *LAST.lock().unwrap() = Some(Err(format!("设置开机启动失败：{}", e.localizedDescription())));
+            }
+            self.refresh_login();
         }
     }
 
@@ -361,15 +377,30 @@ impl Controller {
 
         let status = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
         let menu = NSMenu::new(mtm);
-        let hint = NSMenuItem::new(mtm);
-        hint.setTitle(&NSString::from_str("按住 ⌥ 拖动 .ncm：左 MP3 / 右 WAV"));
-        hint.setEnabled(false);
-        menu.addItem(&hint);
+        let text_item = |t: &str| {
+            let it = NSMenuItem::new(mtm);
+            it.setTitle(&NSString::from_str(t));
+            it.setEnabled(false);
+            it
+        };
+        menu.addItem(&text_item("ZeRingo"));
+        menu.addItem(&text_item("按住 ⌥ 拖动 .ncm：左 MP3 / 右 WAV"));
+        let last_item = text_item("还没有转换记录");
+        menu.addItem(&last_item);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let login_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("登录时自动启动"),
+                Some(sel!(toggleLogin:)),
+                &NSString::from_str(""),
+            )
+        };
+        menu.addItem(&login_item);
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                &NSString::from_str("退出"),
+                &NSString::from_str("退出 ZeRingo"),
                 Some(sel!(terminate:)),
                 &NSString::from_str("q"),
             )
@@ -385,8 +416,12 @@ impl Controller {
             baseline: Cell::new(cc),
             checked: Cell::new(cc),
             title: RefCell::new(String::new()),
+            last_item,
+            login_item,
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+        unsafe { this.ivars().login_item.setTarget(Some(&this)) };
+        this.refresh_login();
         this.refresh_status();
         this
     }
@@ -433,10 +468,10 @@ impl Controller {
         let active = ACTIVE.load(Ordering::SeqCst);
         let last = LAST.lock().unwrap().clone();
         let (title, tip) = match (&last, active) {
-            (_, n) if n > 0 => (format!("NCM ⏳{n}"), "正在转换…".to_string()),
-            (Some(Ok(m)), _) => ("NCM ✓".into(), m.clone()),
-            (Some(Err(m)), _) => ("NCM ✗".into(), m.clone()),
-            (None, _) => ("NCM".into(), "按住 ⌥ 拖动 .ncm 文件".into()),
+            (_, n) if n > 0 => (format!("◐ ⏳{n}"), format!("正在转换 {n} 个文件…")),
+            (Some(Ok(m)), _) => ("◐ ✓".into(), m.clone()),
+            (Some(Err(m)), _) => ("◐ ✗".into(), m.clone()),
+            (None, _) => ("◐".into(), "ZeRingo：按住 ⌥ 拖动 .ncm 文件".into()),
         };
         if *iv.title.borrow() == format!("{title}{tip}") {
             return;
@@ -446,6 +481,18 @@ impl Controller {
             button.setTitle(&NSString::from_str(&title));
             button.setToolTip(Some(&NSString::from_str(&tip)));
         }
+        if last.is_some() || active > 0 {
+            iv.last_item.setTitle(&NSString::from_str(&tip));
+        }
+    }
+
+    /// 只有从 .app 启动时才能设置登录项。
+    fn refresh_login(&self) {
+        let item = &self.ivars().login_item;
+        let in_bundle = NSBundle::mainBundle().bundlePath().to_string().ends_with(".app");
+        item.setEnabled(in_bundle);
+        let on = in_bundle && unsafe { SMAppService::mainAppService().status() } == SMAppServiceStatus::Enabled;
+        item.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
     }
 }
 
@@ -454,7 +501,7 @@ fn run_cli(args: &[String]) -> i32 {
         "mp3" => Target::Mp3,
         "wav" => Target::Wav,
         _ => {
-            eprintln!("用法：ncm-converter [mp3|wav 文件...]\n不带参数运行则启动拖拽模式。");
+            eprintln!("用法：zeringo [mp3|wav 文件...]\n不带参数运行则启动拖拽模式。");
             return 2;
         }
     };
@@ -490,6 +537,6 @@ fn main() {
             true,
         )
     };
-    eprintln!("NCM 转换器已启动：按住 ⌥ Option 拖动 .ncm 文件，左半边 MP3，右半边 WAV。");
+    eprintln!("ZeRingo 已启动：按住 ⌥ Option 拖动 .ncm 文件，左半边 MP3，右半边 WAV。");
     app.run();
 }
